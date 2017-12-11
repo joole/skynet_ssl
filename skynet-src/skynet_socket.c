@@ -83,47 +83,58 @@ forward_message(int type, bool padding, struct socket_message * result) {
 
 int
 skynet_socket_poll() {
-    	struct socket_server *ss = SOCKET_SERVER;
-	assert(ss);
-	struct socket_message result;
-	int more = 1;
-	int type = socket_server_poll(ss, &result, &more);
-	switch (type) {
-	case SOCKET_EXIT:
-		return 0;
-	case SOCKET_DATA:
-		forward_message(SKYNET_SOCKET_TYPE_DATA, false, &result);
-		break;
-	case SOCKET_CLOSE:
-		forward_message(SKYNET_SOCKET_TYPE_CLOSE, false, &result);
-		break;
-	case SOCKET_OPEN:
-		forward_message(SKYNET_SOCKET_TYPE_CONNECT, true, &result);
-		break;
-	case SOCKET_ERR:
-		forward_message(SKYNET_SOCKET_TYPE_ERROR, true, &result);
-		break;
-	case SOCKET_ACCEPT:
-		forward_message(SKYNET_SOCKET_TYPE_ACCEPT, true, &result);
-		break;
-	case SOCKET_UDP:
-		forward_message(SKYNET_SOCKET_TYPE_UDP, false, &result);
-		break;
-	case SOCKET_WARNING:
-		forward_message(SKYNET_SOCKET_TYPE_WARNING, false, &result);
-		break;
-	default:
-		skynet_error(NULL, "Unknown socket message type %d.",type);
-		return -1;
-	}
-	if (more) {
-		return -1;
-	}
-	return 1;
+    //printf("\t----------------- skynet socket poll begin------------------------\n");
+    struct socket_server *ss = SOCKET_SERVER;
+    assert(ss);
+    struct socket_message result;
+    int more = 1;
+    int type = socket_server_poll(ss, &result, &more);
+    switch (type) {
+    case SOCKET_EXIT:
+        //printf("\t [%s][%d] SOCKET_TYPE:SOCKET_EXIT(%d)\n", __func__, __LINE__, type);
+        return 0;
+    case SOCKET_DATA:
+        //printf("\t [%s][%d] SOCKET_TYPE:SOCKET_DATA(%d)\n", __func__, __LINE__, type);
+        forward_message(SKYNET_SOCKET_TYPE_DATA, false, &result);
+        break;
+    case SOCKET_CLOSE:
+        //printf("\t [%s][%d] SOCKET_TYPE:SOCKET_CLOSE(%d)\n", __func__, __LINE__, type);
+        forward_message(SKYNET_SOCKET_TYPE_CLOSE, false, &result);
+        break;
+    case SOCKET_OPEN:
+        //printf("\t [%s][%d] SOCKET_TYPE:SOCKET_OPEN(%d)\n", __func__, __LINE__, type);
+        forward_message(SKYNET_SOCKET_TYPE_CONNECT, true, &result);
+        break;
+    case SOCKET_ERR:
+        //printf("\t [%s][%d] SOCKET_TYPE:SOCKET_ERR(%d)\n", __func__, __LINE__, type);
+        forward_message(SKYNET_SOCKET_TYPE_ERROR, true, &result);
+        break;
+    case SOCKET_ACCEPT:
+        //printf("\t [%s][%d] SOCKET_TYPE:SOCKET_ACCEPT(%d)\n", __func__, __LINE__, type);
+        forward_message(SKYNET_SOCKET_TYPE_ACCEPT, true, &result);
+        break;
+    case SOCKET_UDP:
+        //printf("\t [%s][%d] SOCKET_TYPE:SOCKET_UDP(%d)\n", __func__, __LINE__, type);
+        forward_message(SKYNET_SOCKET_TYPE_UDP, false, &result);
+        break;
+    case SOCKET_WARNING:
+        //printf("\t [%s][%d] SOCKET_TYPE:SOCKET_WARNING(%d)\n", __func__, __LINE__, type);
+        forward_message(SKYNET_SOCKET_TYPE_WARNING, false, &result);
+        break;
+    default:
+        //printf("\t [%s][%d] SOCKET_TYPE:SOCKET_UNKOWN(%d)\n", __func__, __LINE__, type);
+        skynet_error(NULL, "Unknown socket message type %d.",type);
+        return -1;
+    }
+    if (more) {
+        return -1;
+    }
+    return 1;
 }
 
 int
 skynet_socket_send(struct skynet_context *ctx, int id, void *buffer, int sz) {
+    //printf("\t [%s][%d] call\n", __func__, __LINE__);
     return socket_server_send(SOCKET_SERVER, id, buffer, sz);
 }
 

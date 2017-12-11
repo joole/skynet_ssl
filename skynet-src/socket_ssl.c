@@ -43,8 +43,3 @@ void socket_ssl_loadcertification(SSL_CTX* ctx, const char* cert_file , const ch
 
     printf("load certificates complete successfully ...\n");
 }
-
-void handleHanleShake()
-{
-    
-}

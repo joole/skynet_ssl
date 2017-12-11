@@ -23,8 +23,8 @@
 // MAX_SOCKET will be 2^MAX_SOCKET_P
 #define MAX_SOCKET_P 16
 #define MAX_EVENT 64
+//#define MIN_READ_BUFFER 64
 #define MIN_READ_BUFFER 64
-//#define MIN_READ_BUFFER 4096
 #define SOCKET_TYPE_INVALID 0
 #define SOCKET_TYPE_RESERVE 1
 #define SOCKET_TYPE_PLISTEN 2
@@ -34,9 +34,6 @@
 #define SOCKET_TYPE_HALFCLOSE 6
 #define SOCKET_TYPE_PACCEPT 7
 #define SOCKET_TYPE_BIND 8
-//add by joole ---begin
-#define SOCKET_TYPE_SSL_HANDSHAKE 9
-//add by joole ---end
 
 #define MAX_SOCKET (1<<MAX_SOCKET_P)
 
@@ -82,9 +79,7 @@ struct wb_list {
 struct socket {
     bool security;              // 是否是安全的socket
     SSL *ssl;                   // SSL句柄 对客户端使用的
-    SSL_CTX  *ctx;              // ssl 上下文
-    bool handshake;             // 是否握手
-
+    SSL_CTX  *ctx;              // ssl 上下文 
     uintptr_t opaque;           // 是否透明
     struct wb_list high;        // 写缓冲 高
     struct wb_list low;         // 写缓冲 低
@@ -257,7 +252,6 @@ struct send_object {
 
 #define MALLOC skynet_malloc
 #define FREE skynet_free
-#define REALLOC skynet_realloc
 
 // socket 锁
 struct socket_lock {
@@ -507,7 +501,7 @@ static struct socket *
 new_fd(struct socket_server *ss, int id, int fd, int protocol, uintptr_t opaque, bool add) {
     struct socket * s = &ss->slot[HASH_ID(id)];
     assert(s->type == SOCKET_TYPE_RESERVE);
-	printf("\t [%s][%d] new socket will add to epoll queue\n", __func__, __LINE__);
+	//printf("\t [%s][%d] new socket will add to epoll queue\n", __func__, __LINE__);
     if (add) {
         if (sp_add(ss->event_fd, fd, s)) {
             s->type = SOCKET_TYPE_INVALID;
@@ -518,7 +512,6 @@ new_fd(struct socket_server *ss, int id, int fd, int protocol, uintptr_t opaque,
     s->ctx = NULL;
     s->ssl = NULL;
     s->security = false;
-    s->handshake = false;
 
     s->id = id;
     s->fd = fd;
@@ -1077,28 +1070,28 @@ static void
 load_certificates(SSL_CTX *ctx, const char* cert_file, const char* key_file)
 {
     if(SSL_CTX_load_verify_locations(ctx, cert_file, key_file) != 1){
-        //skynet_error(NULL, "can't load sertification file");
+        skynet_error(NULL, "can't load sertification file");
         return;
     }
     if(SSL_CTX_set_default_verify_paths(ctx) != 1)
     {
-        //skynet_error(NULL, "ssl cehck default keys file failed");
+        skynet_error(NULL, "ssl cehck default keys file failed");
         return;
     }
     if(SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <=0)
     {
-        //skynet_error(NULL, "SSL can't load cert file");
+        skynet_error(NULL, "SSL can't load cert file");
         return;
     }
     if(SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) <= 0)
     {
-        //skynet_error(NULL, "SSL can't load private key file");
+        skynet_error(NULL, "SSL can't load private key file");
         return;
     }
 
     // verify private key
     if(!SSL_CTX_check_private_key(ctx)) {
-        //skynet_error(NULL, "not matched cert_file and private_key file");
+        skynet_error(NULL, "not matched cert_file and private_key file");
         return;
     }
 }
@@ -1118,7 +1111,7 @@ setssl_socket(struct socket_server *ss, struct request_setssl *request)
     if (role == 1 && s->type == SOCKET_TYPE_PLISTEN){
         s->ctx = init_server_ctx();
         load_certificates(s->ctx, "./snakeoil.crt", "./snakeoil.key");
-        printf("\t [%s][%d] already set server socket is ssl\n", __func__, __LINE__);
+        //printf("\t [%s][%d] already set server socket is ssl\n", __func__, __LINE__);
     }
     else{
         printf("\t [%s][%d] ssl server init failed\n", __func__, __LINE__);
@@ -1218,7 +1211,7 @@ ctrl_cmd(struct socket_server *ss, struct socket_message *result) {
     // 2. read buffer len
     block_readpipe(fd, buffer, len);
     // ctrl command only exist in local fd, so don't worry about endian.
-    printf("\t [%s][%d] handle ctrl_cmd [%c]\n", __func__, __LINE__, type);
+    //printf("\t [%s][%d] handle ctrl_cmd [%c]\n", __func__, __LINE__, type);
     switch (type) {
     case 'S':
         return start_socket(ss,(struct request_start *)buffer, result);
@@ -1263,95 +1256,78 @@ ctrl_cmd(struct socket_server *ss, struct socket_message *result) {
     return -1;
 }
 
+static bool 
+sslread(SSL* ssl, void* rbuf, int pending_len) {
+    unsigned char *pbuf = (unsigned char *)rbuf;
+    while(pending_len > 0) {
+        int result = SSL_read(ssl, pbuf, pending_len);
+        if(result > 0) {
+            pbuf += result;
+            pending_len -= result;
+            printf("\t[%s][%d] after read full data pending_len %d\n", __func__, __LINE__, pending_len);
 
-static int
-sslread(SSL* ssl, char** buffer, int* ilen)
-{
-    char buf[4096];
-
-    int rd = SSL_read(ssl, buf, sizeof(buf));
-    int ssl_err = SSL_get_error(ssl, rd);
-    if(rd > 0) {
-        *buffer  = buf;
-        *ilen = 4096;
-        return rd;
-    }
-    if (rd < 0 && ssl_err != SSL_ERROR_WANT_READ) {
-        return -1;
-    }
-    if(rd == 0) {
-        return -1;
-    }
-
-    return rd;
-}
-
-static int
-sslwrite(SSL *ssl, const char* buffer, int ilen)
-{
-    int ires = 0, count = 0;
-    bool is_continue = true;
-    while(is_continue)
-    {
-        ires = SSL_write(ssl, buffer + count, ilen - count);
-        int nRes = SSL_get_error(ssl, ires);
-        if(nRes == SSL_ERROR_NONE)
-        {
-            if(ires > 0)
-            {
-                if(count >= ilen)
-                {
-                    break;
-                }
-                count += ires;
+        }
+        else {
+            result = SSL_get_error(ssl, result);
+            if(result == SSL_ERROR_ZERO_RETURN) {
+               printf("\t[%s][%d] connection closed\n", __func__, __LINE__);
+            }
+            else {
+                if(result == SSL_ERROR_WANT_READ) {
+                printf("\t[%s][%d] ssl want to read more\n", __func__, __LINE__);
                 continue;
+                }
+                else if(result == SSL_ERROR_WANT_WRITE) {
+                    printf("\t[%s][%d] ssl want to write more\n", __func__, __LINE__);
+                    continue;
+                }
+                else if(result == SSL_ERROR_SYSCALL) {
+                    printf("\t[%s][%d] SSL read failed error no %d\n", __func__, __LINE__, errno);
+                    if((errno == EINTR || (errno == EAGAIN) || (errno == EWOULDBLOCK))) {
+                        continue;
+                    }
+                    if(errno == ETIMEDOUT) {
+                        continue;
+                    }
+                }
+                else if( result == SSL_ERROR_SSL) {
+                    printf("\t[%s][%d] SSL read failed error no %s\n", __func__, __LINE__, ERR_reason_error_string(ERR_get_error()));
+                }
+                else {
+                    printf("\t[%s][%d] SSL read failed error no %d\n", __func__, __LINE__, errno);
+                }
+                printf("\t[%s][%d] SSL read failed\n", __func__, __LINE__);
             }
-        }
-        else if(nRes == SSL_ERROR_WANT_WRITE)
-        {
-            printf("\t [%s][%d] SSL want to write more\n", __func__, __LINE__);
-            continue;
-        }
-        else if(nRes == SSL_ERROR_WANT_READ){
-            printf("\t [%s][%d] SSL want to read more\n", __func__, __LINE__);
-            if(count >= ilen) {
-                break;
-            }
-            continue;
-        }
-        else{
-            int error;
-            socklen_t len = sizeof(error);
-            int code = getsockopt(SSL_get_fd(ssl), SOL_SOCKET, SO_ERROR, &error, &len);
-            return code;
+            return false;
         }
     }
-
-    return count;
-}
+    return true;
+} 
 
 // return -1 (ignore) when error
 static int
 forward_message_tcp(struct socket_server *ss, struct socket *s, struct socket_lock *l, struct socket_message * result) {
+    //printf("\t [%s][%d] 读取连接客户端的缓存内容\n", __func__, __LINE__);
     int sz = s->p.size;
-    char * buffer = MALLOC(sz);
+    char * buffer = NULL;
     // modify by joole ---begin
     int n = 0;
-    if(s->security && s->ssl && s->handshake) {
-        int rd = SSL_read(s->ssl, buffer, sz);
-        int ssl_err = SSL_get_error(s->ssl, rd);
-        if(rd > 0) {
-            n = rd;
-        }
-        if((rd < 0 &&ssl_err != SSL_ERROR_WANT_READ) || rd == 0){
-            n = -1;
-        }
-        printf("\t [%s][%d] ssl_read content sz=%d rd=%d ssl_err=%d\n", __func__, __LINE__,sz, rd, ssl_err);
+    if(s->security && s->ssl != NULL) {
+        n = SSL_read(s->ssl, NULL, 0);
+        int real_content = SSL_pending(s->ssl);
+        sz = real_content > n ? ((real_content / MIN_READ_BUFFER) + 1) * MIN_READ_BUFFER : n; 
+        buffer = MALLOC(sz);
+        n = SSL_read(s->ssl, buffer, sz);
+        //printf("\t[%s][%d] reaelcontent_length :%d , ssl read size:%d\n%s", __func__, __LINE__,real_content, n, buffer);
+        s->p.size = sz;
     }
+        
     else{
+        buffer = MALLOC(sz);
         n = (int)read(s->fd, buffer, sz);
+        //printf("\t [%s][%d] read by read id = %d, fd=%d, code = %d\n", __func__, __LINE__, s->id, s->fd, n);
     }
-    printf("\t [%s][%d] read content length=%d sz=%d\n%s\n", __func__, __LINE__, n,sz, buffer);
+    //printf("\t [%s][%d] read content length=%d sz=%d\n%s\n", __func__, __LINE__, n,sz, buffer);
     // modify by joole --- end
 
     // modify by joole --- old source
@@ -1526,57 +1502,25 @@ report_accept(struct socket_server *ss, struct socket *s, struct socket_message 
     result->id = s->id;
     result->ud = id;
     result->data = NULL;
-    
-
-    void * sin_addr = (u.s.sa_family == AF_INET) ? (void*)&u.v4.sin_addr : (void *)&u.v6.sin6_addr;
-    int sin_port = ntohs((u.s.sa_family == AF_INET) ? u.v4.sin_port : u.v6.sin6_port);
-    char tmp[INET6_ADDRSTRLEN];
-    if (inet_ntop(u.s.sa_family, sin_addr, tmp, sizeof(tmp))) {
-        snprintf(ss->buffer, sizeof(ss->buffer), "%s:%d", tmp, sin_port);
-        result->data = ss->buffer;
-    }
-
     //add by joole  --begin
     if(s->security) {
-        printf("\t [%s][%d] client info id=%d, fd=%d, client_fd=%d\n", __func__, __LINE__, ns->id, ns->fd, client_fd);
-        printf("\t [%s][%d] server accept socket is ssl, so client socket will ssl too\n", __func__, __LINE__);
+        //printf("\t [%s][%d] client info id=%d, fd=%d, client_fd=%d\n", __func__, __LINE__, ns->id, ns->fd, client_fd);
+        //printf("\t [%s][%d] server accept socket is ssl, so client socket will ssl too\n", __func__, __LINE__);
         ns->security = true;
         if (s->ctx == NULL){
-            printf("\t [%s][%d] server_socket SSL_CTX is nullptr\n", __func__, __LINE__);
+            //printf("\t [%s][%d] server_socket SSL_CTX is nullptr\n", __func__, __LINE__);
             close(client_fd);
             return 0;
         }
         ns->ssl = SSL_new(s->ctx);
         if (ns->ssl == NULL) {
-            printf("\t [%s][%d] can't create new \n", __func__, __LINE__);
+            //printf("\t [%s][%d] can't create new \n", __func__, __LINE__);
             close(client_fd);
             return 0;
         }
         SSL_set_mode(ns->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
         SSL_set_fd(ns->ssl, ns->fd);
         SSL_set_accept_state(ns->ssl);
-        /*
-        int r = SSL_do_handshake(ns->ssl);
-        if(r == 1){
-            //已经ok，什么都不做了
-            printf("\t [%s][%d]!!!! ssl_handshake ok\n", __func__, __LINE__);
-        }
-        int err = SSL_get_error(ns->ssl, r);
-        if(err == SSL_ERROR_WANT_WRITE){
-            sp_read(ss->event_fd, s->fd, s, false);
-            printf("\t [%s][%d]!!!! ssl_handshake WANT_WRITE\n", __func__, __LINE__);
-            return 0;
-        }
-        else if(err == SSL_ERROR_WANT_READ){
-            sp_write(ss->event_fd, ns->fd, ns, true);
-            printf("\t [%s][%d]!!!! ssl_handshake WANT_READ\n", __func__, __LINE__);
-            return 0;
-        }
-        else{
-            printf("\t [%s][%d]!!!! ssl_handshake failed\n", __func__, __LINE__);
-            return -1;
-        }
-        
         bool is_continue = true;
         bool accept_ok = false;
         while(is_continue) {
@@ -1586,20 +1530,20 @@ report_accept(struct socket_server *ss, struct socket *s, struct socket_message 
                 int iret = SSL_get_error(ns->ssl, icode);
                 if(iret == SSL_ERROR_WANT_READ) {
                     is_continue = true;
-					printf("\t [%s][%d]!!!! SSL_Accept want to read more\n", __func__, __LINE__);
+					//printf("\t [%s][%d]!!!! SSL_Accept want to read more\n", __func__, __LINE__);
                 }
                 else {
                     unsigned long err_code = 0;
                     char err_msg[1024] = {0};
                     ERR_error_string(err_code, err_msg);
-                    printf("\t [%s][%d]!!!! SSL_Accept Error (%d)(%s)\n", __func__, __LINE__, iret, err_msg);
+                    //printf("\t [%s][%d]!!!! SSL_Accept Error (%d)(%s)\n", __func__, __LINE__, iret, err_msg);
                     SSL_free(ns->ssl);
                     close(client_fd);
                     break;
                 }
             }
             else{
-                printf("\t [%s][%d]!!!! SSL_Accept OK\n", __func__, __LINE__);
+                //printf("\t [%s][%d]!!!! SSL_Accept OK\n", __func__, __LINE__);
                 accept_ok = true;
                 break;
             }
@@ -1607,12 +1551,19 @@ report_accept(struct socket_server *ss, struct socket *s, struct socket_message 
         if (accept_ok)
             printf("\t [%s][%d] !!!!!! new client SSL Accept\n", __func__, __LINE__);
         else{
-            printf("\t [%s][%d]!!!! SSL_Accept Failed", __func__, __LINE__);
+            //printf("\t [%s][%d]!!!! SSL_Accept Failed", __func__, __LINE__);
             return 0;
         }
-        */
     }
     // add by joole ---end
+
+    void * sin_addr = (u.s.sa_family == AF_INET) ? (void*)&u.v4.sin_addr : (void *)&u.v6.sin6_addr;
+    int sin_port = ntohs((u.s.sa_family == AF_INET) ? u.v4.sin_port : u.v6.sin6_port);
+    char tmp[INET6_ADDRSTRLEN];
+    if (inet_ntop(u.s.sa_family, sin_addr, tmp, sizeof(tmp))) {
+        snprintf(ss->buffer, sizeof(ss->buffer), "%s:%d", tmp, sin_port);
+        result->data = ss->buffer;
+    }
 
     return 1;
 }
@@ -1644,13 +1595,13 @@ int
 socket_server_poll(struct socket_server *ss, struct socket_message * result, int * more) {
     for (;;) {
         // if has sockete_ctrl_command, must be handled it first
-        printf("\t --------------------------new loop begin -----------------------------------------\n");
+        //printf("\t --------------------------new loop begin -----------------------------------------\n");
         if (ss->checkctrl) {
-            printf("\t [%s][%d] socket_server:ss checkctrl has checkctrl flag\n", __func__, __LINE__);
+            //printf("\t [%s][%d] socket_server:ss checkctrl has checkctrl flag\n", __func__, __LINE__);
             if (has_cmd(ss)) {
-                printf("\t [%s][%d] socket_server *ss has_cmd type\n", __func__, __LINE__);
+                //printf("\t [%s][%d] socket_server *ss has_cmd type\n", __func__, __LINE__);
                 int type = ctrl_cmd(ss, result);
-                printf("\t [%s][%d] socket_server *ss handle cmd result:%d\n", __func__, __LINE__, type);
+                //printf("\t [%s][%d] socket_server *ss handle cmd result:%d\n", __func__, __LINE__, type);
                 if (type != -1) {
                     clear_closed_event(ss, result, type);
                     return type;
@@ -1658,15 +1609,15 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
                     continue;
                 }
             } else {
-                printf("\t [%s][%d] socket_server *ss has no cmd\n", __func__, __LINE__);
+                //printf("\t [%s][%d] socket_server *ss has no cmd\n", __func__, __LINE__);
                 ss->checkctrl = 0;
             }
         }
         else{
-            printf("\t [%s][%d] socket_server:ss checkctrl has no checkctrl flag\n", __func__, __LINE__);
+            //printf("\t [%s][%d] socket_server:ss checkctrl has no checkctrl flag\n", __func__, __LINE__);
         }
         if (ss->event_index == ss->event_n) {
-            printf("\t [%s][%d] ss->event_index:%d == ss->event_n:%d will waiting sys socket status\n", __func__, __LINE__, ss->event_index, ss->event_n);
+            //printf("\t [%s][%d] ss->event_index:%d == ss->event_n:%d will waiting sys socket status\n", __func__, __LINE__, ss->event_index, ss->event_n);
             ss->event_n = sp_wait(ss->event_fd, ss->ev, MAX_EVENT);
             ss->checkctrl = 1;
             if (more) {
@@ -1674,7 +1625,7 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
             }
 
             ss->event_index = 0;
-            printf("\t [%s][%d] sp_wait has get signal ss->event_index:%d, ss->event_n:%d\n", __func__, __LINE__, ss->event_index, ss->event_n);
+            //printf("\t [%s][%d] sp_wait has get signal ss->event_index:%d, ss->event_n:%d\n", __func__, __LINE__, ss->event_index, ss->event_n);
             if (ss->event_n <= 0) {
                 ss->event_n = 0;
                 if (errno == EINTR) {
@@ -1684,7 +1635,7 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
             }
         }
         else{
-            printf("\t [%s][%d] socket_server:ss->event_index:%d ss->event_n:%d\n", __func__, __LINE__, ss->event_index, ss->event_n);
+            //printf("\t [%s][%d] socket_server:ss->event_index:%d ss->event_n:%d\n", __func__, __LINE__, ss->event_index, ss->event_n);
         }
         struct event *e = &ss->ev[ss->event_index++];
         struct socket *s = e->s;
@@ -1693,58 +1644,39 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
             // dispatch pipe message at beginning
             continue;
         }
-        printf("\t [%s][%d] according event_index:%d get socket(id s->id:%d, s->fd:%d)\n", __func__, __LINE__, ss->event_index - 1, s->id, s->fd);
+        //printf("\t [%s][%d] according event_index:%d get socket(id s->id:%d, s->fd:%d)\n", __func__, __LINE__, ss->event_index - 1, s->id, s->fd);
         struct socket_lock l;
         socket_lock_init(s, &l);
         switch (s->type) {
         case SOCKET_TYPE_CONNECTING:
-            printf("\t [%s][%d] SOCKET_TYPE_XXX:SOCKET_TYPE_CONNECTING(%d)\n", __func__, __LINE__, s->type);
+            //printf("\t [%s][%d] SOCKET_TYPE_XXX:SOCKET_TYPE_CONNECTING(%d)\n", __func__, __LINE__, s->type);
             return report_connect(ss, s, &l, result);
         case SOCKET_TYPE_LISTEN: {
-            printf("\t [%s][%d] SOCKET_TYPE_XXX:SOCKET_TYPE_LISTEN(%d)\n", __func__, __LINE__, s->type);
+            //printf("\t [%s][%d] SOCKET_TYPE_XXX:SOCKET_TYPE_LISTEN(%d)\n", __func__, __LINE__, s->type);
             int ok = report_accept(ss, s, result);
             if (ok > 0) {
-                printf("\t [%s][%d] report_accept ok s->id:%d, s->fd:%d\n", __func__, __LINE__, s->id, s->fd);
+                //printf("\t [%s][%d] report_accept ok s->id:%d, s->fd:%d\n", __func__, __LINE__, s->id, s->fd);
                 return SOCKET_ACCEPT;
             } if (ok < 0 ) {
-                printf("\t [%s][%d] report_accept failed\n", __func__, __LINE__);
+                //printf("\t [%s][%d] report_accept failed\n", __func__, __LINE__);
                 return SOCKET_ERR;
             }
             // when ok == 0, retry
             break;
         }
         case SOCKET_TYPE_INVALID:
-            printf("\t [%s][%d] SOCKET_TYPE_XXX:SOCKET_TYPE_INVALID(%d)\n", __func__, __LINE__, s->type);
+            //printf("\t [%s][%d] SOCKET_TYPE_XXX:SOCKET_TYPE_INVALID(%d)\n", __func__, __LINE__, s->type);
             fprintf(stderr, "socket-server: invalid socket\n");
             break;
         default:
-			// for ssl handshake
-			printf("\t [%s][%d] !!!!DEFAULT socket_type :%d id=%d, fd=%d\n", __func__, __LINE__, s->type, s->id, s->fd);
-			if (s->type == SOCKET_TYPE_CONNECTED)
-			{
-				if(s->security && s->ssl != NULL && s->handshake == false){
-                    int r = SSL_do_handshake(s->ssl);
-                    int ssl_err = SSL_get_error(s->ssl, r);
-                    if(r == 1){
-                        s->handshake = true;
-                        printf("\t [%s][%d] !!!!handle handshake ok\n", __func__, __LINE__);
-                        return SOCKET_DATA;
-                    }
-                    else if( ssl_err == SSL_ERROR_WANT_READ){
-                        sp_write(ss->event_fd, s->fd, s, false);
-                    }
-                    else if( ssl_err == SSL_ERROR_WANT_WRITE) {
-                        sp_write(ss->event_fd, s->fd, s, true);
-                    }
-                    break;
-                }
-			}
             if (e->read) {
+                //printf("\t [%s][%d] event has read status\n", __func__, __LINE__);
                 int type;
                 if (s->protocol == PROTOCOL_TCP) {
+                    //printf("\t [%s][%d] read tcp buffer and send it to mq s->id:%d, s->fd:%d\n", __func__, __LINE__, s->id, s->fd);
                     type = forward_message_tcp(ss, s, &l, result);
                 } else {
-                    printf("\t [%s][%d] read udp buffer and send it to mq\n", __func__, __LINE__);
+                    //printf("\t [%s][%d] read udp buffer and send it to mq\n", __func__, __LINE__);
                     type = forward_message_udp(ss, s, &l, result);
                     if (type == SOCKET_UDP) {
                         // try read again
@@ -1762,14 +1694,14 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
                 return type;
             }
             if (e->write) {
-                printf("\t [%s][%d] event has write status\n", __func__, __LINE__);
+                //printf("\t [%s][%d] event has write status\n", __func__, __LINE__);
                 int type = send_buffer(ss, s, &l, result);
                 if (type == -1)
                     break;
                 return type;
             }
             if (e->error) {
-                printf("\t [%s][%d] event has error status\n", __func__, __LINE__);
+                //printf("\t [%s][%d] event has error status\n", __func__, __LINE__);
                 // close when error
                 int error;
                 socklen_t len = sizeof(error);
@@ -1845,7 +1777,7 @@ can_direct_write(struct socket *s, int id) {
 // return -1 when error, 0 when success
 int
 socket_server_send(struct socket_server *ss, int id, const void * buffer, int sz) {
-    printf("\t [%s][%d] want to send info to client\n", __func__, __LINE__);
+    //printf("\t [%s][%d] want to send info to client\n", __func__, __LINE__);
     struct socket * s = &ss->slot[HASH_ID(id)];
     if (s->id != id || s->type == SOCKET_TYPE_INVALID) {
         free_buffer(ss, buffer, sz);
@@ -1864,10 +1796,8 @@ socket_server_send(struct socket_server *ss, int id, const void * buffer, int sz
             ssize_t n;
             if (s->protocol == PROTOCOL_TCP) {
                 // add by joole ---begin
-                
                 if (s->security){
                     n = SSL_write(s->ssl, so.buffer, so.sz);
-                    //n = sslwrite(s->ssl, so.buffer, so.sz);
                 }
                 else{
                     n = write(s->fd, so.buffer, so.sz);
@@ -2033,7 +1963,7 @@ socket_server_listen(struct socket_server *ss, uintptr_t opaque, const char * ad
     request.u.listen.id = id;
     request.u.listen.fd = fd;
     send_request(ss, &request, 'L', sizeof(request.u.listen));
-    printf("\t [%s][%d] socket listen %s:%d:%d reverse_id:%d raw_fd:%d\n", __func__, __LINE__, addr, port, backlog, id, fd);
+    //printf("\t [%s][%d] socket listen %s:%d:%d reverse_id:%d raw_fd:%d\n", __func__, __LINE__, addr, port, backlog, id, fd);
     return id;
 }
 
